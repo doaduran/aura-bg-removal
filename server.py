@@ -4,9 +4,10 @@ from rembg import remove, new_session
 from PIL import Image, ImageOps, ImageEnhance
 import io
 import base64
+import os
 import uvicorn
 
-app = FastAPI(title="Aura AI Pro Studio Backend")
+app = FastAPI(title="Aura AI Studio Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,28 +17,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Yüksek hassasiyetli e-ticaret/kıyafet kesim modeli (isnet-general-use)
-print("⏳ AI Segmentasyon Modeli Yükleniyor...")
-session = new_session("isnet-general-use")
-print("✅ AI Modeli Hazır!")
+# 512MB RAM limitine tam oturan hafif model (u2netp)
+session = new_session("u2netp")
 
 def enhance_cloth_image(img: Image.Image) -> Image.Image:
-    """Kıyafetin ışık, gölge ve renk canlılığını stüdyo moduna getirir."""
-    # RGBA kanallarına ayır
     r, g, b, a = img.split()
     rgb_img = Image.merge('RGB', (r, g, b))
-    
-    # 1. Otomatik Pozlama & Kontrast Dengeleme (Sarı/karanlık ışığı temizler)
     rgb_img = ImageOps.autocontrast(rgb_img, cutoff=1)
     
-    # 2. Renk Canlılığını ve Netliği hafif optimize et
     enhancer_color = ImageEnhance.Color(rgb_img)
     rgb_img = enhancer_color.enhance(1.08)
     
     enhancer_sharp = ImageEnhance.Sharpness(rgb_img)
     rgb_img = enhancer_sharp.enhance(1.15)
     
-    # Şeffaf Alpha kanalıyla tekrar birleştir
     r2, g2, b2 = rgb_img.split()
     return Image.merge('RGBA', (r2, g2, b2, a))
 
@@ -51,28 +44,20 @@ async def remove_background(file: UploadFile = File(...)):
         contents = await file.read()
         input_image = Image.open(io.BytesIO(contents)).convert("RGBA")
         
-        # 1. Yüksek hassasiyetli arka plan kesimi (ISNet + Post Processing)
-        segmented = remove(
-            input_image, 
-            session=session,
-            alpha_matting=True,
-            alpha_matting_foreground_threshold=240,
-            alpha_matting_background_threshold=10,
-            post_process_mask=True
-        )
+        # Hafif segmentasyon
+        segmented = remove(input_image, session=session)
         
-        # 2. Işık ve kumaş rengi optimizasyonu
+        # Renk ve stüdyo canlılığı optimizasyonu
         final_image = enhance_cloth_image(segmented)
         
-        # 3. Base64 olarak geri döndür
         buffered = io.BytesIO()
         final_image.save(buffered, format="PNG")
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
         
         return {"image_base64": f"data:image/png;base64,{img_str}"}
     except Exception as e:
-        print(f"Hata oluştu: {e}")
         return {"error": str(e)}, 500
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
