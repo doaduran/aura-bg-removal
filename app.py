@@ -4,6 +4,11 @@ import io
 import os
 from typing import Optional
 
+# onnxruntime, "OMP_NUM_THREADS" ortam değişkenini kendi thread sayısı için
+# okuyor (rembg'nin session_factory.py'si bunu böyle kullanıyor). Bunu 1'e
+# sabitlemek, session import edilip oluşturulmadan ÖNCE ayarlanmalı.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from PIL import Image
@@ -61,11 +66,20 @@ def remove_bg(payload: RemoveBgRequest, x_proxy_secret: Optional[str] = Header(d
 
     try:
         input_bytes = base64.b64decode(payload.image_file_b64)
-        input_image = Image.open(io.BytesIO(input_bytes)).convert("RGBA")
+        input_image = Image.open(io.BytesIO(input_bytes))
+
+        # ÖNEMLİ: JPEG'lerde draft(), dosyayı TAM ÇÖZÜNÜRLÜKTE decode etmeden
+        # önce JPEG'in kendi katmanlı yapısını kullanarak küçük boyutta decode
+        # etmeyi sağlar. Bu olmadan, thumbnail() çağrılsa bile telefon
+        # fotoğrafı (örn. 4032x3024) önce TAM boyutuyla belleğe açılıyordu -
+        # OOM'un asıl sebebi buydu. PNG'lerde draft() etkisizdir, zararı olmaz.
+        input_image.draft("RGB", (MAX_DIMENSION, MAX_DIMENSION))
+        input_image = input_image.convert("RGBA")
     except Exception:
         raise HTTPException(status_code=400, detail="Geçersiz görsel verisi")
 
-    # Büyük fotoğrafları küçült, bellek sınırını aşmamak için (oranı korur, sadece büyükse küçültür)
+    # Draft sonrası boyut hâlâ MAX_DIMENSION'ı aşabilir (draft sadece 1/2, 1/4, 1/8
+    # gibi katlarda küçültür), bu yüzden thumbnail ile kesin sınıra çekiyoruz.
     input_image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
 
     output_image = remove(input_image, session=session)
