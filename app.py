@@ -4,21 +4,42 @@ import io
 import os
 from typing import Optional
 
-# onnxruntime, "OMP_NUM_THREADS" ortam değişkenini kendi thread sayısı için
-# okuyor (rembg'nin session_factory.py'si bunu böyle kullanıyor). Bunu 1'e
-# sabitlemek, session import edilip oluşturulmadan ÖNCE ayarlanmalı.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-
+import numpy as np
+import onnxruntime as ort
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from PIL import Image
-from rembg import remove, new_session
 
 app = FastAPI()
 
-# u2netp, u2net'in hafifletilmiş versiyonu (4MB, u2net ise 176MB).
-# Render'ın ücretsiz planındaki 512MB bellek sınırına sığmak için bunu kullanıyoruz.
-session = new_session("u2netp")
+# --- Model ---
+# rembg paketini artık kullanmıyoruz. rembg'yi kurmak scipy, scikit-image,
+# opencv-python-headless, pymatting gibi ağır kütüphaneleri de zorunlu
+# olarak getiriyordu; bunlar sunucu hiç istek almadan sadece açılırken bile
+# ~300-400MB taban bellek tüketimine sebep oluyordu (512MB sınırında bu,
+# neredeyse tüm bütçeyi tek başına tüketiyordu). Bunun yerine u2netp.onnx
+# modelini (4MB) doğrudan onnxruntime ile çalıştırıyoruz - Dockerfile bu
+# modeli build sırasında indirip imaja gömüyor, burada sadece yüklüyoruz.
+MODEL_PATH = os.environ.get("MODEL_PATH", "/app/models/u2netp.onnx")
+
+sess_opts = ort.SessionOptions()
+# Thread başına ayrılan ekstra bellek tamponunu sınırlamak için thread
+# sayısını 1'e sabitliyoruz (eskiden OMP_NUM_THREADS ortam değişkenine
+# güveniyorduk, artık SessionOptions üzerinden doğrudan ve garantili
+# şekilde ayarlıyoruz).
+sess_opts.intra_op_num_threads = 1
+sess_opts.inter_op_num_threads = 1
+
+session = ort.InferenceSession(
+    MODEL_PATH, sess_options=sess_opts, providers=["CPUExecutionProvider"]
+)
+INPUT_NAME = session.get_inputs()[0].name
+
+# u2netp'nin beklediği giriş boyutu ve ImageNet normalizasyon değerleri.
+# rembg'nin session_base.py / sessions/u2netp.py kaynağıyla doğrulandı.
+MODEL_INPUT_SIZE = (320, 320)
+MEAN = (0.485, 0.456, 0.406)
+STD = (0.229, 0.224, 0.225)
 
 # Telefon fotoğrafları genelde çok yüksek çözünürlüklü oluyor (örn. 4000x3000px),
 # bu da işlerken gereksiz yere fazla bellek harcatıyor. İşlemeden önce
@@ -33,6 +54,41 @@ PROXY_SECRET = os.environ.get("PROXY_SECRET")
 
 class RemoveBgRequest(BaseModel):
     image_file_b64: str
+
+
+def predict_mask(img: Image.Image) -> Image.Image:
+    """u2netp ile ön plan maskesi üretir. rembg'nin BaseSession.normalize()
+    ve U2netpSession.predict() adımlarının birebir aynısı."""
+    im = img.convert("RGB").resize(MODEL_INPUT_SIZE, Image.LANCZOS)
+
+    im_ary = np.array(im).astype(np.float32)
+    im_ary = im_ary / np.max(im_ary)
+
+    tmp_img = np.zeros((im_ary.shape[0], im_ary.shape[1], 3), dtype=np.float32)
+    tmp_img[:, :, 0] = (im_ary[:, :, 0] - MEAN[0]) / STD[0]
+    tmp_img[:, :, 1] = (im_ary[:, :, 1] - MEAN[1]) / STD[1]
+    tmp_img[:, :, 2] = (im_ary[:, :, 2] - MEAN[2]) / STD[2]
+    tmp_img = tmp_img.transpose((2, 0, 1))
+    ort_input = {INPUT_NAME: np.expand_dims(tmp_img, 0).astype(np.float32)}
+
+    ort_outs = session.run(None, ort_input)
+    pred = ort_outs[0][:, 0, :, :]
+    ma, mi = np.max(pred), np.min(pred)
+    pred = (pred - mi) / (ma - mi)
+    pred = np.squeeze(pred)
+
+    mask = Image.fromarray((pred * 255).astype(np.uint8), mode="L")
+    mask = mask.resize(img.size, Image.LANCZOS)
+    return mask
+
+
+def remove_background(img: Image.Image) -> Image.Image:
+    """rembg'nin naive_cutout()'u ile aynı: maskeyi alfa kanalı olarak kullanıp
+    orijinal görseli şeffaf bir tuval üzerine composite eder."""
+    mask = predict_mask(img)
+    empty = Image.new("RGBA", img.size, 0)
+    cutout = Image.composite(img.convert("RGBA"), empty, mask)
+    return cutout
 
 
 def trim_transparent_margin(img: Image.Image, margin_percent: float = 0.08) -> Image.Image:
@@ -82,7 +138,7 @@ def remove_bg(payload: RemoveBgRequest, x_proxy_secret: Optional[str] = Header(d
     # gibi katlarda küçültür), bu yüzden thumbnail ile kesin sınıra çekiyoruz.
     input_image.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
 
-    output_image = remove(input_image, session=session)
+    output_image = remove_background(input_image)
     output_image = trim_transparent_margin(output_image)
 
     buffer = io.BytesIO()
